@@ -649,6 +649,13 @@ cap_msi(struct device *d, int where, int cap)
     }
 }
 
+static int exp_downstream_port(int type)
+{
+  return type == PCI_EXP_TYPE_ROOT_PORT ||
+	 type == PCI_EXP_TYPE_DOWNSTREAM ||
+	 type == PCI_EXP_TYPE_PCIE_BRIDGE;	/* PCI/PCI-X to PCIe Bridge */
+}
+
 static float power_limit(int value, int scale)
 {
   static const float scales[4] = { 1.0, 0.1, 0.01, 0.001 };
@@ -815,7 +822,7 @@ static void cap_express_link(struct device *d, int where, int type)
   printf("\t\tLnkCtl:\tASPM %s;", aspm_enabled(w & PCI_EXP_LNKCTL_ASPM));
   if ((type == PCI_EXP_TYPE_ROOT_PORT) || (type == PCI_EXP_TYPE_ENDPOINT) ||
       (type == PCI_EXP_TYPE_LEG_END) || (type == PCI_EXP_TYPE_PCI_BRIDGE))
-    printf(" RCB %d bytes", w & PCI_EXP_LNKCTL_RCB ? 128 : 64);
+    printf(" RCB %d bytes,", w & PCI_EXP_LNKCTL_RCB ? 128 : 64);
   printf(" Disabled%c CommClk%c\n\t\t\tExtSynch%c ClockPM%c AutWidDis%c BWInt%c AutBWInt%c\n",
 	FLAG(w, PCI_EXP_LNKCTL_DISABLE),
 	FLAG(w, PCI_EXP_LNKCTL_CLOCK),
@@ -1024,14 +1031,14 @@ static const char *cap_express_devcap2_tphcomp(int tph)
   switch (tph)
     {
       case 1:
-        return "TPHComp+, ExtTPHComp-";
+        return "TPHComp+ ExtTPHComp-";
       case 2:
         /* Reserved; intentionally left blank */
         return "";
       case 3:
-        return "TPHComp+, ExtTPHComp+";
+        return "TPHComp+ ExtTPHComp+";
       default:
-        return "TPHComp-, ExtTPHComp-";
+        return "TPHComp- ExtTPHComp-";
     }
 }
 
@@ -1077,12 +1084,12 @@ static void cap_express_dev2(struct device *d, int where, int type)
   int has_mem_bar = device_has_memory_space_bar(d);
 
   l = get_conf_long(d, where + PCI_EXP_DEVCAP2);
-  printf("\t\tDevCap2: Completion Timeout: %s, TimeoutDis%c, NROPrPrP%c, LTR%c",
+  printf("\t\tDevCap2: Completion Timeout: %s, TimeoutDis%c NROPrPrP%c LTR%c",
         cap_express_dev2_timeout_range(PCI_EXP_DEV2_TIMEOUT_RANGE(l)),
         FLAG(l, PCI_EXP_DEV2_TIMEOUT_DIS),
 	FLAG(l, PCI_EXP_DEVCAP2_NROPRPRP),
         FLAG(l, PCI_EXP_DEVCAP2_LTR));
-  printf("\n\t\t\t 10BitTagComp%c, 10BitTagReq%c, OBFF %s, ExtFmt%c, EETLPPrefix%c",
+  printf("\n\t\t\t 10BitTagComp%c 10BitTagReq%c OBFF %s, ExtFmt%c EETLPPrefix%c",
         FLAG(l, PCI_EXP_DEVCAP2_10BIT_TAG_COMP),
         FLAG(l, PCI_EXP_DEVCAP2_10BIT_TAG_REQ),
         cap_express_devcap2_obff(PCI_EXP_DEVCAP2_OBFF(l)),
@@ -1101,14 +1108,14 @@ static void cap_express_dev2(struct device *d, int where, int type)
   printf("\n\t\t\t FRS%c", FLAG(l, PCI_EXP_DEVCAP2_FRS));
 
   if (type == PCI_EXP_TYPE_ROOT_PORT)
-    printf(", LN System CLS %s",
+    printf(" LN System CLS %s,",
           cap_express_devcap2_lncls(PCI_EXP_DEVCAP2_LN_CLS(l)));
 
   if (type == PCI_EXP_TYPE_ROOT_PORT || type == PCI_EXP_TYPE_ENDPOINT)
-    printf(", %s", cap_express_devcap2_tphcomp(PCI_EXP_DEVCAP2_TPH_COMP(l)));
+    printf(" %s", cap_express_devcap2_tphcomp(PCI_EXP_DEVCAP2_TPH_COMP(l)));
 
   if (type == PCI_EXP_TYPE_ROOT_PORT || type == PCI_EXP_TYPE_DOWNSTREAM)
-    printf(", ARIFwd%c\n", FLAG(l, PCI_EXP_DEV2_ARI));
+    printf(" ARIFwd%c\n", FLAG(l, PCI_EXP_DEV2_ARI));
   else
     printf("\n");
   if (type == PCI_EXP_TYPE_ROOT_PORT || type == PCI_EXP_TYPE_UPSTREAM ||
@@ -1127,7 +1134,7 @@ static void cap_express_dev2(struct device *d, int where, int type)
     }
 
   w = get_conf_word(d, where + PCI_EXP_DEVCTL2);
-  printf("\t\tDevCtl2: Completion Timeout: %s, TimeoutDis%c, LTR%c, OBFF %s",
+  printf("\t\tDevCtl2: Completion Timeout: %s, TimeoutDis%c LTR%c OBFF %s,",
 	cap_express_dev2_timeout_value(PCI_EXP_DEV2_TIMEOUT_VALUE(w)),
 	FLAG(w, PCI_EXP_DEV2_TIMEOUT_DIS),
 	FLAG(w, PCI_EXP_DEV2_LTR),
@@ -1149,6 +1156,29 @@ static void cap_express_dev2(struct device *d, int where, int type)
         printf(" EgressBlck%c", FLAG(w, PCI_EXP_DEV2_ATOMICOP_EGRESS_BLOCK));
       printf("\n");
     }
+}
+
+static const char *cap_express_link2_speed_cap(int vector)
+{
+  /*
+   * Per PCIe r5.0, sec 8.2.1, a device must support 2.5GT/s and is not
+   * permitted to skip support for any data rates between 2.5GT/s and the
+   * highest supported rate.
+   */
+  if (vector & 0x60)
+    return "RsvdP";
+  if (vector & 0x10)
+    return "2.5-32GT/s";
+  if (vector & 0x08)
+    return "2.5-16GT/s";
+  if (vector & 0x04)
+    return "2.5-8GT/s";
+  if (vector & 0x02)
+    return "2.5-5GT/s";
+  if (vector & 0x01)
+    return "2.5GT/s";
+
+  return "Unknown";
 }
 
 static const char *cap_express_link2_speed(int type)
@@ -1202,12 +1232,59 @@ static const char *cap_express_link2_transmargin(int type)
     }
 }
 
+static const char *cap_express_link2_crosslink_res(int crosslink)
+{
+  switch (crosslink)
+    {
+      case 0:
+        return "unsupported";
+      case 1:
+        return "Upstream Port";
+      case 2:
+        return "Downstream Port";
+      default:
+        return "incomplete";
+    }
+}
+
+static const char *cap_express_link2_component(int presence)
+{
+  switch (presence)
+    {
+      case 0:
+        return "Link Down - Not Determined";
+      case 1:
+        return "Link Down - Not Present";
+      case 2:
+        return "Link Down - Present";
+      case 4:
+        return "Link Up - Present";
+      case 5:
+        return "Link Up - Present and DRS Received";
+      default:
+        return "Reserved";
+    }
+}
+
 static void cap_express_link2(struct device *d, int where, int type)
 {
+  u32 l = 0;
   u16 w;
 
   if (!((type == PCI_EXP_TYPE_ENDPOINT || type == PCI_EXP_TYPE_LEG_END) &&
 	(d->dev->dev != 0 || d->dev->func != 0))) {
+    /* Link Capabilities 2 was reserved before PCIe r3.0 */
+    l = get_conf_long(d, where + PCI_EXP_LNKCAP2);
+    if (l) {
+      printf("\t\tLnkCap2: Supported Link Speeds: %s, Crosslink%c "
+	"Retimer%c 2Retimers%c DRS%c\n",
+	  cap_express_link2_speed_cap(PCI_EXP_LNKCAP2_SPEED(l)),
+	  FLAG(l, PCI_EXP_LNKCAP2_CROSSLINK),
+	  FLAG(l, PCI_EXP_LNKCAP2_RETIMER),
+	  FLAG(l, PCI_EXP_LNKCAP2_2RETIMERS),
+	  FLAG(l, PCI_EXP_LNKCAP2_DRS));
+    }
+
     w = get_conf_word(d, where + PCI_EXP_LNKCTL2);
     printf("\t\tLnkCtl2: Target Link Speed: %s, EnterCompliance%c SpeedDis%c",
 	cap_express_link2_speed(PCI_EXP_LNKCTL2_SPEED(w)),
@@ -1226,14 +1303,26 @@ static void cap_express_link2(struct device *d, int where, int type)
   }
 
   w = get_conf_word(d, where + PCI_EXP_LNKSTA2);
-  printf("\t\tLnkSta2: Current De-emphasis Level: %s, EqualizationComplete%c, EqualizationPhase1%c\n"
-	"\t\t\t EqualizationPhase2%c, EqualizationPhase3%c, LinkEqualizationRequest%c\n",
+  printf("\t\tLnkSta2: Current De-emphasis Level: %s, EqualizationComplete%c EqualizationPhase1%c\n"
+	"\t\t\t EqualizationPhase2%c EqualizationPhase3%c LinkEqualizationRequest%c\n"
+	"\t\t\t Retimer%c 2Retimers%c CrosslinkRes: %s",
 	cap_express_link2_deemphasis(PCI_EXP_LINKSTA2_DEEMPHASIS(w)),
 	FLAG(w, PCI_EXP_LINKSTA2_EQU_COMP),
 	FLAG(w, PCI_EXP_LINKSTA2_EQU_PHASE1),
 	FLAG(w, PCI_EXP_LINKSTA2_EQU_PHASE2),
 	FLAG(w, PCI_EXP_LINKSTA2_EQU_PHASE3),
-	FLAG(w, PCI_EXP_LINKSTA2_EQU_REQ));
+	FLAG(w, PCI_EXP_LINKSTA2_EQU_REQ),
+	FLAG(w, PCI_EXP_LINKSTA2_RETIMER),
+	FLAG(w, PCI_EXP_LINKSTA2_2RETIMERS),
+	cap_express_link2_crosslink_res(PCI_EXP_LINKSTA2_CROSSLINK(w)));
+
+  if (exp_downstream_port(type) && (l & PCI_EXP_LNKCAP2_DRS)) {
+    printf(", DRS%c\n"
+	"\t\t\t DownstreamComp: %s\n",
+	FLAG(w, PCI_EXP_LINKSTA2_DRS_RCVD),
+	cap_express_link2_component(PCI_EXP_LINKSTA2_COMPONENT(w)));
+  } else
+    printf("\n");
 }
 
 static void cap_express_slot2(struct device *d UNUSED, int where UNUSED)

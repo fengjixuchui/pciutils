@@ -1,7 +1,7 @@
 /*
  *	The PCI Utilities -- Show Extended Capabilities
  *
- *	Copyright (c) 1997--2010 Martin Mares <mj@ucw.cz>
+ *	Copyright (c) 1997--2020 Martin Mares <mj@ucw.cz>
  *
  *	Can be freely distributed and used under the terms of the GNU GPL.
  */
@@ -89,7 +89,7 @@ cap_sec(struct device *d, int where)
     return;
 
   ctrl3 = get_conf_word(d, where + PCI_SEC_LNKCTL3);
-  printf("\t\tLnkCtl3: LnkEquIntrruptEn%c, PerformEqu%c\n",
+  printf("\t\tLnkCtl3: LnkEquIntrruptEn%c PerformEqu%c\n",
 	FLAG(ctrl3, PCI_SEC_LNKCTL3_LNK_EQU_REQ_INTR_EN),
 	FLAG(ctrl3, PCI_SEC_LNKCTL3_PERFORM_LINK_EQU));
 
@@ -635,6 +635,57 @@ cap_rclink(struct device *d, int where)
 }
 
 static void
+cap_dvsec_cxl(struct device *d, int where)
+{
+  u16 l;
+
+  printf(": CXL\n");
+  if (verbose < 2)
+    return;
+
+  if (!config_fetch(d, where + PCI_CXL_CAP, 12))
+    return;
+
+  l = get_conf_word(d, where + PCI_CXL_CAP);
+  printf("\t\tCXLCap:\tCache%c IO%c Mem%c Mem HW Init%c HDMCount %d Viral%c\n",
+    FLAG(l, PCI_CXL_CAP_CACHE), FLAG(l, PCI_CXL_CAP_IO), FLAG(l, PCI_CXL_CAP_MEM),
+    FLAG(l, PCI_CXL_CAP_MEM_HWINIT), PCI_CXL_CAP_HDM_CNT(l), FLAG(l, PCI_CXL_CAP_VIRAL));
+
+  l = get_conf_word(d, where + PCI_CXL_CTRL);
+  printf("\t\tCXLCtl:\tCache%c IO%c Mem%c Cache SF Cov %d Cache SF Gran %d Cache Clean%c Viral%c\n",
+    FLAG(l, PCI_CXL_CTRL_CACHE), FLAG(l, PCI_CXL_CTRL_IO), FLAG(l, PCI_CXL_CTRL_MEM),
+    PCI_CXL_CTRL_CACHE_SF_COV(l), PCI_CXL_CTRL_CACHE_SF_GRAN(l), FLAG(l, PCI_CXL_CTRL_CACHE_CLN),
+    FLAG(l, PCI_CXL_CTRL_VIRAL));
+
+  l = get_conf_word(d, where + PCI_CXL_STATUS);
+  printf("\t\tCXLSta:\tViral%c\n", FLAG(l, PCI_CXL_STATUS_VIRAL));
+}
+
+static void
+cap_dvsec(struct device *d, int where)
+{
+  printf("Designated Vendor-Specific: ");
+  if (!config_fetch(d, where + PCI_DVSEC_HEADER1, 8))
+    {
+      printf("<unreadable>\n");
+      return;
+    }
+
+  u32 hdr = get_conf_long(d, where + PCI_DVSEC_HEADER1);
+  u16 vendor = BITS(hdr, 0, 16);
+  byte rev = BITS(hdr, 16, 4);
+  u16 len = BITS(hdr, 20, 12);
+
+  u16 id = get_conf_long(d, where + PCI_DVSEC_HEADER2);
+
+  printf("Vendor=%04x ID=%04x Rev=%d Len=%d", vendor, id, rev, len);
+  if (vendor == PCI_DVSEC_VENDOR_ID_CXL && id == PCI_DVSEC_ID_CXL && len >= 16)
+    cap_dvsec_cxl(d, where);
+  else
+    printf(" <?>\n");
+}
+
+static void
 cap_evendor(struct device *d, int where)
 {
   u32 hdr;
@@ -797,6 +848,95 @@ cap_ptm(struct device *d, int where)
     }
 }
 
+static void
+print_rebar_range_size(int ld2_size)
+{
+  // This function prints the input as a power-of-2 size value
+  // It is biased with 1MB = 0, ...
+  // Maximum resizable BAR value supported is 2^63 bytes = 43
+  // for the extended resizable BAR capability definition
+  // (otherwise it would stop at 2^28)
+
+  if (ld2_size >= 0 && ld2_size < 10)
+    printf(" %dMB", (1 << ld2_size));
+  else if (ld2_size >= 10 && ld2_size < 20)
+    printf(" %dGB", (1 << (ld2_size-10)));
+  else if (ld2_size >= 20 && ld2_size < 30)
+    printf(" %dTB", (1 << (ld2_size-20)));
+  else if (ld2_size >= 30 && ld2_size < 40)
+    printf(" %dPB", (1 << (ld2_size-30)));
+  else if (ld2_size >= 40 && ld2_size < 44)
+    printf(" %dEB", (1 << (ld2_size-40)));
+  else
+    printf(" <unknown>");
+}
+
+static void
+cap_rebar(struct device *d, int where, int virtual)
+{
+  u32 sizes_buffer, control_buffer, ext_sizes, current_size;
+  u16 bar_index, barcount, i;
+  // If the structure exists, at least one bar is defined
+  u16 num_bars = 1;
+
+  printf("%s Resizable BAR\n", (virtual) ? "Virtual" : "Physical");
+
+  if (verbose < 2)
+    return;
+
+  // Go through all defined BAR definitions of the caps, at minimum 1
+  // (loop also terminates if num_bars read from caps is > 6)
+  for (barcount = 0; barcount < num_bars; barcount++)
+    {
+      where += 4;
+
+      // Get the next BAR configuration
+      if (!config_fetch(d, where, 8))
+        {
+          printf("\t\t<unreadable>\n");
+          return;
+        }
+
+      sizes_buffer = get_conf_long(d, where) >> 4;
+      where += 4;
+      control_buffer = get_conf_long(d, where);
+
+      bar_index  = BITS(control_buffer, 0, 3);
+      current_size = BITS(control_buffer, 8, 6);
+      ext_sizes = BITS(control_buffer, 16, 16);
+
+      if (barcount == 0)
+        {
+          // Only index 0 controlreg has the num_bar count definition
+          num_bars = BITS(control_buffer, 5, 3);
+	  if (num_bars < 1 || num_bars > 6)
+	    {
+	      printf("\t\t<error in resizable BAR: num_bars=%d is out of specification>\n", num_bars);
+	      break;
+	    }
+        }
+
+      // Resizable BAR list entry have an arbitrary index and current size
+      printf("\t\tBAR %d: current size:", bar_index);
+      print_rebar_range_size(current_size);
+
+      if (sizes_buffer || ext_sizes)
+	{
+	  printf(", supported:");
+
+	  for (i=0; i<28; i++)
+	    if (sizes_buffer & (1U << i))
+	      print_rebar_range_size(i);
+
+	  for (i=0; i<16; i++)
+	    if (ext_sizes & (1U << i))
+	      print_rebar_range_size(i + 28);
+	}
+
+      printf("\n");
+    }
+}
+
 void
 show_ext_caps(struct device *d, int type)
 {
@@ -885,7 +1025,7 @@ show_ext_caps(struct device *d, int type)
 	    cap_pri(d, where);
 	    break;
 	  case PCI_EXT_CAP_ID_REBAR:
-	    printf("Resizable BAR <?>\n");
+	    cap_rebar(d, where, 0);
 	    break;
 	  case PCI_EXT_CAP_ID_DPA:
 	    printf("Dynamic Power Allocation <?>\n");
@@ -924,10 +1064,10 @@ show_ext_caps(struct device *d, int type)
 	    printf("Readiness Time Reporting <?>\n");
 	    break;
 	  case PCI_EXT_CAP_ID_DVSEC:
-	    printf("Designated Vendor-Specific <?>\n");
+	    cap_dvsec(d, where);
 	    break;
 	  case PCI_EXT_CAP_ID_VF_REBAR:
-	    printf("VF Resizable BAR <?>\n");
+	    cap_rebar(d, where, 1);
 	    break;
 	  case PCI_EXT_CAP_ID_DLNK:
 	    printf("Data Link Feature <?>\n");
